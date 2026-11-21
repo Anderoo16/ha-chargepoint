@@ -127,8 +127,12 @@ async def test_coordinator_invalid_session_raises_auth_failed(
     coordinator = hass.data[DOMAIN][setup_integration.entry_id][DATA_COORDINATOR]
     mock_client.get_account = AsyncMock(side_effect=make_invalid_session())
 
-    with pytest.raises(ConfigEntryAuthFailed):
+    with patch(
+        "custom_components.chargepoint.ChargePoint.create",
+        side_effect=make_invalid_session(),
+    ) as reconnect, pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
+    reconnect.assert_awaited_once()
 
 
 async def test_coordinator_datadome_captcha_raises_auth_failed(
@@ -157,8 +161,9 @@ async def test_coordinator_communication_error_raises_update_failed(
         await coordinator._async_update_data()
 
 
-async def test_coordinator_runtime_error_recovers_automatically(
-    hass, setup_integration, mock_client
+@pytest.mark.parametrize("rejected_by_server", [False, True])
+async def test_coordinator_session_expiry_recovers_automatically(
+    hass, setup_integration, mock_client, rejected_by_server
 ):
     """When the session cookie expires (RuntimeError), the coordinator re-logs in and retries."""
     from custom_components.chargepoint.const import DATA_CLIENT, DATA_COORDINATOR
@@ -168,7 +173,11 @@ async def test_coordinator_runtime_error_recovers_automatically(
     # First call raises RuntimeError (session cookie expired); subsequent calls succeed.
     mock_client.get_account = AsyncMock(
         side_effect=[
-            RuntimeError("Must login to use ChargePoint API"),
+            (
+                make_invalid_session()
+                if rejected_by_server
+                else RuntimeError("Must login to use ChargePoint API")
+            ),
         ]
     )
 
@@ -183,6 +192,14 @@ async def test_coordinator_runtime_error_recovers_automatically(
     assert data is not None
     assert hass.data[DOMAIN][setup_integration.entry_id][DATA_CLIENT] is new_client
     mock_client.close.assert_awaited_once()
+    restart = er.async_get(hass).async_get_entity_id(
+        "button", DOMAIN, f"{CHARGER_ID}_restart_charger"
+    )
+    await hass.services.async_call(
+        "button", "press", {"entity_id": restart}, blocking=True
+    )
+    new_client.restart_home_charger.assert_awaited_once_with(CHARGER_ID)
+    mock_client.restart_home_charger.assert_not_awaited()
 
 
 async def test_coordinator_runtime_error_relogin_invalid_session_raises_auth_failed(

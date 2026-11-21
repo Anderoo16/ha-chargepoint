@@ -385,11 +385,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         nonlocal client
         try:
             data = await _async_coordinator_update(client, entry, coordinator.data)
-        except RuntimeError:
-            # The library raises RuntimeError("Must login to use ChargePoint API")
-            # when the coulomb_sess cookie has expired from the aiohttp cookie jar.
-            # Attempt to recover automatically using the stored token before
-            # falling back to a full reauthentication prompt.
+        except (RuntimeError, ConfigEntryAuthFailed) as exc:
+            if isinstance(exc, ConfigEntryAuthFailed) and not isinstance(
+                exc.__cause__, InvalidSession
+            ):
+                raise
+            # The live client can lose its cookie or receive a 401 before
+            # the saved credentials become invalid. Rebuild it once.
             _LOGGER.warning(
                 "ChargePoint session has expired; attempting automatic re-login"
             )
@@ -422,6 +424,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         name=DOMAIN,
         update_method=async_update_data,
         update_interval=timedelta(seconds=poll_interval),
+        config_entry=entry,
     )
 
     hass.data[DOMAIN][entry.entry_id] = {
@@ -479,7 +482,16 @@ class ChargePointEntity(CoordinatorEntity):
     def __init__(self, client, coordinator):
         """Initialize the ChargePoint entity."""
         super().__init__(coordinator)
-        self.client = client
+        self._initial_client = client
+
+    @property
+    def client(self) -> ChargePoint:
+        """Resolve the current client after the coordinator reconnects."""
+        entry = self.coordinator.config_entry
+        if entry is None:
+            return self._initial_client
+        clients = self.coordinator.hass.data.get(DOMAIN, {})
+        return clients.get(entry.entry_id, {}).get(DATA_CLIENT, self._initial_client)
 
     @property
     def account(self) -> Account:
@@ -497,15 +509,14 @@ class ChargePointEntity(CoordinatorEntity):
         return self.coordinator.data[ACCT_SESSION]
 
 
-class ChargePointChargerEntity(CoordinatorEntity):
+class ChargePointChargerEntity(ChargePointEntity):
     """Base ChargePoint Charger Entity"""
 
     def __init__(
         self, client: ChargePoint, coordinator: DataUpdateCoordinator, charger_id: int
     ):
         """Initialize the ChargePoint entity."""
-        super().__init__(coordinator)
-        self.client = client
+        super().__init__(client, coordinator)
         self.charger_id = charger_id
         self.manufacturer = (
             "ChargePoint"
